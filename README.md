@@ -1,34 +1,56 @@
 # github-core-clone
 
-A standalone GitHub-compatible git forge in TypeScript, using only the Node
-standard library. One process, one in-memory store, four surfaces:
+[![make.fun](https://make.fun/badge/Orchdhaaa/github-core-clone)](https://make.fun/bounty/github-core-clone-01)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-- **Git smart HTTP** at `/{owner}/{repo}.git` — upload-pack protocol v2 (with
-  a v0 fallback) and receive-pack v0, with shallow fetch, annotated-tag
-  peeling and strict fast-forward pushes.
-- **REST v3** at `/api/v3` — repositories, branches, commits, contents,
-  labels, issues, comments and pull requests with squash merge and 3-way
-  conflict detection.
-- **GraphQL v4** at `/api/graphql` — a dependency-free parser and executor
-  with fragments, aliases, variables, batched documents, cursor pagination
-  and introspection.
-- **MCP** at `/mcp` — JSON-RPC 2.0 over Streamable HTTP, revision 2026-07-28
-  with the legacy initialize handshake, six tools.
+A standalone, GitHub-compatible git forge in one Node process. No database, no
+UI, no git binary, no npm dependencies: just the standard library. It serves
+the four surfaces agents already speak, from its own in-memory store:
 
-## Run
+- **Git smart HTTP** — upload-pack protocol v2 and v0, receive-pack v0, with
+  exact-set and shallow fetch, annotated-tag peeling, and fast-forward-only
+  pushes with per-ref report-status.
+- **REST v3** — repositories, branches, commits, contents, labels, issues,
+  comments and pull requests, including squash merge with 3-way conflict
+  detection, under `/api/v3`.
+- **GraphQL v4** — a dependency-free parser and executor at `/api/graphql`,
+  with fragments, aliases, variables, batch documents, cursor pagination and
+  introspection.
+- **MCP** — JSON-RPC 2.0 at `/mcp`, revision 2026-07-28 (`server/discover`)
+  and the handshake revisions through `initialize`, exposing six tools
+  (`create_repo`, `get_repo`, `create_issue`, `list_issues`,
+  `create_pull_request`, `merge_pull_request`).
+
+## Run it
 
 ```sh
-MAKEFUN_SHOP_TOKEN=<token> node main.ts
+node main.ts
 ```
 
-The server binds an ephemeral port on 127.0.0.1. When `MAKEFUN_ENV_URL` is
-set, it registers its port with the harness, waits for the trial to finish,
-then exits 0. Without it, the server stays up for local checks.
-
-`GET /healthz` answers `{"ok": true}`.
+With `MAKEFUN_ENV_URL` set (a trial pod) the server binds an ephemeral port,
+registers it with the suite, and exits 0 when the suite answers `/done`.
+Without it (local development) it listens on `$PORT` (or an ephemeral port)
+and keeps serving; set `MAKEFUN_SHOP_TOKEN` to the bearer token the suite
+presents.
 
 ## Determinism
 
-Every timestamp comes from `MAKEFUN_TRIAL_NOW` and every ordering counter is
-a plain increment. No wall clock, no unseeded randomness, so a replayed trial
-produces byte-identical results.
+No wall clock and no unseeded randomness reach any observable output.
+Timestamps come from `MAKEFUN_TRIAL_NOW` plus a counter clock, ids and
+request ids from counters, so two runs of the same request sequence produce
+byte-identical output and a replay matches its live pass.
+
+## Layout
+
+- `main.ts` — entrypoint: bind, register, long-poll `/done`, exit 0.
+- `app.ts` — HTTP server, routing, auth, request ids.
+- `store.ts` — in-memory store, deterministic clock, git object operations.
+- `gitpack.ts` — pkt-lines and packfiles (build, parse, deltas).
+- `gitproto.ts` — upload-pack v0/v2, receive-pack v0, advertisements.
+- `rest.ts` — REST v3 handlers and serializers.
+- `graphql.ts` — GraphQL parser, executor and introspection.
+- `mcp.ts` — MCP tools over the same store.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

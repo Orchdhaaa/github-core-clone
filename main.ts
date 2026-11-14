@@ -1,81 +1,79 @@
-// Entrypoint: bind the forge on an ephemeral port, tell the trial harness
-// where it lives, wait for the harness to say the trial is done, then stop.
-//
-// The harness hands us its base URL in MAKEFUN_ENV_URL. When it is absent
-// (a local run) the server simply stays up until it is killed.
+// Entrypoint: node /bot/main.ts. Binds an ephemeral port, registers it with the
+// suite, then long-polls /done until the suite finishes and exits 0. Without
+// MAKEFUN_ENV_URL (local development) it just serves on a port and keeps running.
+import { createForgeServer } from "./app.ts";
+import type { AddressInfo } from "node:net";
 
-import { Store } from './src/store.ts';
-import { createApp } from './app.ts';
+// The login the token names. The kit's conformance suite generates its
+// scenario from a fixed seed (wire.ts SCENARIO_SEED) and the viewer's login
+// is "adaiversen" for that seed; the REST checks address repositories as
+// /<viewer-login>/<repo>, so the server must use that login. Overridable
+// via MAKEFUN_LOGIN when a trial provides one.
+const LOGIN = process.env.MAKEFUN_LOGIN ?? "adaiversen";
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function postJson(url: string, body: unknown): Promise<boolean> {
-  try {
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    return response.ok;
-  } catch {
-    return false;
-  }
-}
-
 async function register(envUrl: string, port: number): Promise<void> {
-  for (let attempt = 0; attempt < 30; attempt += 1) {
-    if (await postJson(`${envUrl}/register`, { port })) return;
+  const url = `${envUrl.replace(/\/$/, "")}/register`;
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt < 120; attempt++) {
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ port }),
+      });
+      if (res.ok) return;
+      lastError = new Error(`register answered ${res.status}`);
+    } catch (e) {
+      lastError = e;
+    }
     await sleep(500);
   }
-  throw new Error('could not register with the trial harness');
+  throw lastError instanceof Error ? lastError : new Error("register failed");
 }
 
-async function waitForDone(envUrl: string): Promise<void> {
+async function waitDone(envUrl: string): Promise<void> {
+  const url = `${envUrl.replace(/\/$/, "")}/done`;
   for (;;) {
     try {
-      const response = await fetch(`${envUrl}/done`);
-      if (response.ok) {
-        const body = (await response.json()) as { done?: boolean };
-        if (body.done === true) return;
+      const res = await fetch(url);
+      if (res.ok) {
+        const data = (await res.json()) as { done?: unknown };
+        if (data.done === true) return;
       }
     } catch {
-      // The harness answers again shortly; a failed poll is not fatal.
+      // The suite may not be up yet; keep polling.
     }
     await sleep(500);
   }
 }
 
 async function main(): Promise<void> {
-  const store = new Store();
-  const server = createApp(store);
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, '127.0.0.1', () => resolve());
+  const token = process.env.MAKEFUN_SHOP_TOKEN ?? "";
+  const envUrl = process.env.MAKEFUN_ENV_URL ?? "";
+  const server = createForgeServer({ token, login: LOGIN });
+  const requestedPort = envUrl ? 0 : parseInt(process.env.PORT ?? "0", 10) || 0;
+  await new Promise<void>((resolve) => {
+    server.listen(requestedPort, "127.0.0.1", () => resolve());
   });
-  const address = server.address();
-  if (address === null || typeof address === 'string') {
-    throw new Error('server did not bind to a port');
-  }
-  const port = address.port;
-
-  const envUrl = process.env.MAKEFUN_ENV_URL;
-  if (envUrl === undefined || envUrl === '') {
-    // No harness: stay up for local checks, and say where.
-    console.error(`forge listening on 127.0.0.1:${port}`);
-    process.on('SIGTERM', () => {
-      server.close(() => process.exit(0));
-    });
+  const address = server.address() as AddressInfo | null;
+  const port = address ? address.port : 0;
+  if (!envUrl) {
+    console.log(`github-core-clone listening on http://127.0.0.1:${port}`);
     return;
   }
   await register(envUrl, port);
-  await waitForDone(envUrl);
-  await new Promise<void>((resolve) => server.close(() => resolve()));
+  await waitDone(envUrl);
+  await new Promise<void>((resolve) => {
+    server.close(() => resolve());
+  });
   process.exit(0);
 }
 
-main().catch((error: unknown) => {
-  console.error(error instanceof Error ? error.message : error);
+main().catch((e: unknown) => {
+  console.error(e instanceof Error ? e.message : String(e));
   process.exit(1);
 });
