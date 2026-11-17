@@ -120,6 +120,18 @@ export interface Repo {
   nextNumber: number;
   issueJsonCache: Map<number, string>;
   packCache: Map<string, Buffer>;
+  // Parsed-object caches: git objects are immutable once stored, so a commit
+  // or tree parsed once never needs re-parsing.
+  commitCache: Map<string, CommitInfo>;
+  treeCache: Map<string, TreeEntry[]>;
+  // Ancestor set of each ref's tip, maintained incrementally on ref moves.
+  refAncestors: Map<string, Set<string>>;
+  // Shas of the tag objects in the db, so tag lookups never scan all objects.
+  tagShas: Set<string>;
+  // Advertisement caches, invalidated on any ref change.
+  uploadV0Adv: Buffer | null;
+  receiveV0Adv: Buffer | null;
+  lsRefsCache: Map<string, Buffer>;
 }
 
 export interface Store {
@@ -174,6 +186,13 @@ export function createRepo(store: Store, name: string, description: string, isPr
     nextNumber: 1,
     issueJsonCache: new Map(),
     packCache: new Map(),
+    commitCache: new Map(),
+    treeCache: new Map(),
+    refAncestors: new Map(),
+    tagShas: new Set(),
+    uploadV0Adv: null,
+    receiveV0Adv: null,
+    lsRefsCache: new Map(),
   };
   store.repos.set(name, repo);
   return repo;
@@ -228,8 +247,19 @@ export function serializeTree(entries: TreeEntry[]): Buffer {
 
 export function storeObject(repo: Repo, type: ObjType, data: Buffer): string {
   const sha = hashObject(type, data);
-  if (!repo.objects.has(sha)) repo.objects.set(sha, { type, data });
+  if (!repo.objects.has(sha)) {
+    repo.objects.set(sha, { type, data });
+    if (type === "tag") repo.tagShas.add(sha);
+  }
   return sha;
+}
+
+// Store an object whose sha is already known (e.g. parsed out of a packfile):
+// no re-hash, just insert-if-absent and keep the tag set current.
+export function putObject(repo: Repo, type: ObjType, data: Buffer, sha: string): void {
+  if (repo.objects.has(sha)) return;
+  repo.objects.set(sha, { type, data });
+  if (type === "tag") repo.tagShas.add(sha);
 }
 
 export function getObject(repo: Repo, sha: string): GitObject | undefined {
@@ -270,6 +300,29 @@ export function serializeCommit(info: CommitInfo): Buffer {
   return Buffer.from(`${lines.join("\n")}\n\n${info.message}`, "utf8");
 }
 
+// Cached commit/tree parsing: objects are immutable once stored, so a commit
+// or tree parsed once never needs re-parsing. Returns null when the object
+// is missing or of another type.
+export function commitInfo(repo: Repo, sha: string): CommitInfo | null {
+  const cached = repo.commitCache.get(sha);
+  if (cached) return cached;
+  const obj = getObject(repo, sha);
+  if (!obj || obj.type !== "commit") return null;
+  const info = parseCommit(obj.data);
+  repo.commitCache.set(sha, info);
+  return info;
+}
+
+export function treeEntries(repo: Repo, sha: string): TreeEntry[] | null {
+  const cached = repo.treeCache.get(sha);
+  if (cached) return cached;
+  const obj = getObject(repo, sha);
+  if (!obj || obj.type !== "tree") return null;
+  const entries = parseTree(obj.data);
+  repo.treeCache.set(sha, entries);
+  return entries;
+}
+
 export function gitActor(store: Store): string {
   const epoch = store.clock.nextEpoch();
   return `${store.login} <${store.login}@users.noreply.github.com> ${epoch} +0000`;
@@ -296,9 +349,9 @@ export function treeWithFile(
   blobSha: string,
 ): string {
   const parts = path.split("/").filter((p) => p.length > 0);
-  const baseTreeSha = baseCommitSha ? parseCommit(getObject(repo, baseCommitSha)!.data).tree : null;
+  const baseTreeSha = baseCommitSha ? commitInfo(repo, baseCommitSha)!.tree : null;
   const recurse = (treeSha: string | null, depth: number): string => {
-    const entries = treeSha ? parseTree(getObject(repo, treeSha)!.data) : [];
+    const entries = treeSha ? treeEntries(repo, treeSha)! : [];
     const name = parts[depth];
     if (depth === parts.length - 1) {
       const next = entries.filter((e) => e.name !== name);
@@ -322,9 +375,9 @@ export function treeWithoutFile(
   path: string,
 ): string | null {
   const parts = path.split("/").filter((p) => p.length > 0);
-  const baseTreeSha = parseCommit(getObject(repo, baseCommitSha)!.data).tree;
+  const baseTreeSha = commitInfo(repo, baseCommitSha)!.tree;
   const recurse = (treeSha: string, depth: number): string | null => {
-    const entries = parseTree(getObject(repo, treeSha)!.data);
+    const entries = treeEntries(repo, treeSha)!;
     const name = parts[depth];
     if (depth === parts.length - 1) {
       const found = entries.some((e) => e.name === name);
@@ -353,18 +406,18 @@ export function flatTree(
 ): Map<string, { mode: string; sha: string }> {
   const out = new Map<string, { mode: string; sha: string }>();
   if (!commitSha) return out;
-  const commit = getObject(repo, commitSha);
-  if (!commit) return out;
+  const info = commitInfo(repo, commitSha);
+  if (!info) return out;
   const walk = (treeSha: string, prefix: string): void => {
-    const tree = getObject(repo, treeSha);
-    if (!tree) return;
-    for (const e of parseTree(tree.data)) {
+    const entries = treeEntries(repo, treeSha);
+    if (!entries) return;
+    for (const e of entries) {
       const p = prefix ? `${prefix}/${e.name}` : e.name;
       if (e.mode === "40000") walk(e.sha, p);
       else out.set(p, { mode: e.mode, sha: e.sha });
     }
   };
-  walk(parseCommit(commit.data).tree, "");
+  walk(info.tree, "");
   return out;
 }
 
@@ -417,9 +470,9 @@ export function ancestors(repo: Repo, tip: string): Set<string> {
     const sha = stack.pop()!;
     if (seen.has(sha)) continue;
     seen.add(sha);
-    const obj = getObject(repo, sha);
-    if (!obj || obj.type !== "commit") continue;
-    for (const p of parseCommit(obj.data).parents) stack.push(p);
+    const info = commitInfo(repo, sha);
+    if (!info) continue;
+    for (const p of info.parents) stack.push(p);
   }
   return seen;
 }
@@ -439,11 +492,11 @@ export function mergeBase(repo: Repo, a: string, b: string): string | null {
   // BFS from b upward, first commit that is also an ancestor of a.
   const queue: string[] = [b];
   const seen = new Set<string>([b]);
-  while (queue.length > 0) {
-    const sha = queue.shift()!;
-    const obj = getObject(repo, sha);
-    if (!obj || obj.type !== "commit") continue;
-    for (const p of parseCommit(obj.data).parents) {
+  for (let qi = 0; qi < queue.length; qi++) {
+    const sha = queue[qi];
+    const info = commitInfo(repo, sha);
+    if (!info) continue;
+    for (const p of info.parents) {
       if (aAnc.has(p)) return p;
       if (!seen.has(p)) {
         seen.add(p);
@@ -460,6 +513,101 @@ export function refName(branch: string): string {
 
 export function branchTip(repo: Repo, branch: string): string | null {
   return repo.refs.get(refName(branch)) ?? null;
+}
+
+// Every ref change invalidates the caches derived from refs: packfiles,
+// both v0 advertisements, and cached ls-refs responses.
+export function invalidateRefCaches(repo: Repo): void {
+  repo.packCache.clear();
+  repo.uploadV0Adv = null;
+  repo.receiveV0Adv = null;
+  repo.lsRefsCache.clear();
+}
+
+// Walk the ancestors of tip, stopping at commits already in base: their
+// ancestors are already in base (it is ancestor-closed), so they add nothing
+// new. Returns the visited commits plus whether oldTip was reached.
+function walkNewAncestors(
+  repo: Repo,
+  tip: string,
+  base: Set<string>,
+  oldTip: string | undefined,
+): { added: Set<string>; sawOld: boolean } {
+  const added = new Set<string>();
+  const stack = [tip];
+  let sawOld = tip === oldTip;
+  while (stack.length > 0) {
+    const sha = stack.pop()!;
+    if (added.has(sha)) continue;
+    added.add(sha);
+    if (sha === oldTip) {
+      sawOld = true;
+      continue;
+    }
+    if (base.has(sha)) continue;
+    const info = commitInfo(repo, sha);
+    if (!info) continue;
+    for (const p of info.parents) stack.push(p);
+  }
+  return { added, sawOld };
+}
+
+// Move a ref to a new tip, maintaining its ancestor set incrementally and
+// invalidating the ref-derived caches. All ref writes go through here (or
+// deleteRef) so the caches and ancestor sets cannot drift from refs.
+// Fast-forward moves (the common case: the old tip is an ancestor of the new
+// one) cost only the walk over the new commits; any other move recomputes
+// the set from scratch so the invariant refAncestors[ref] == ancestors(tip)
+// stays exact.
+export function setRef(repo: Repo, ref: string, sha: string): void {
+  const oldTip = repo.refs.get(ref);
+  let base = repo.refAncestors.get(ref);
+  if (!base && oldTip) base = ancestors(repo, oldTip);
+  let next: Set<string>;
+  if (!base || base.size === 0) {
+    next = ancestors(repo, sha);
+  } else {
+    const { added, sawOld } = walkNewAncestors(repo, sha, base, oldTip);
+    if (sawOld) {
+      next = new Set([...base, ...added]);
+    } else {
+      next = ancestors(repo, sha);
+    }
+  }
+  repo.refs.set(ref, sha);
+  repo.refAncestors.set(ref, next);
+  invalidateRefCaches(repo);
+}
+
+export function deleteRef(repo: Repo, ref: string): void {
+  repo.refs.delete(ref);
+  repo.refAncestors.delete(ref);
+  invalidateRefCaches(repo);
+}
+
+// Fast-forward check for a push to ref: is oldSha an ancestor of newSha?
+// Walks from newSha only, pruning at commits already known to be ancestors
+// of the ref's current tip: such a commit's ancestors are all in that set,
+// and oldSha is not among them unless the commit IS oldSha (a commit in the
+// set other than oldSha is a strict ancestor of oldSha, so oldSha cannot be
+// reached through it). Falls back to the full walk when no set is tracked.
+export function isFastForward(repo: Repo, ref: string, oldSha: string, newSha: string): boolean {
+  if (oldSha === newSha) return true;
+  const known = repo.refAncestors.get(ref);
+  if (!known) return isAncestor(repo, oldSha, newSha);
+  const stack = [newSha];
+  const seen = new Set<string>();
+  while (stack.length > 0) {
+    const sha = stack.pop()!;
+    if (sha === oldSha) return true;
+    if (seen.has(sha)) continue;
+    seen.add(sha);
+    if (known.has(sha)) continue;
+    const info = commitInfo(repo, sha);
+    if (!info) continue;
+    for (const p of info.parents) stack.push(p);
+  }
+  return false;
 }
 
 // Squash-merge pr into its base branch. Returns the new commit sha, or null
@@ -506,8 +654,7 @@ export function squashMerge(
   const treeSha = treeFromFlat(repo, merged);
   const message = `${pr.title} (#${pr.number})\n\n${pr.body}`.trimEnd();
   const sha = createCommit(store, repo, treeSha, baseTip ? [baseTip] : [], message);
-  repo.refs.set(refName(pr.baseRef), sha);
-  repo.packCache.clear();
+  setRef(repo, refName(pr.baseRef), sha);
   return { sha };
 }
 

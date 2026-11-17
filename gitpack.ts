@@ -3,7 +3,7 @@
 import { inflateSync, deflateSync } from "node:zlib";
 import { createHash } from "node:crypto";
 import type { ObjType, Repo } from "./store.ts";
-import { getObject, parseCommit, parseTree } from "./store.ts";
+import { commitInfo, getObject, treeEntries } from "./store.ts";
 
 // ---------------------------------------------------------------------------
 // pkt-line
@@ -134,10 +134,34 @@ export function buildPack(objects: { type: ObjType; data: Buffer }[]): Buffer {
   return Buffer.concat([body, trailer]);
 }
 
-// Inflate one zlib stream starting at buf[0]. The stream's end is found by
-// binary search: a truncated deflate stream throws, a complete one succeeds
-// and ignores trailing bytes, so the predicate is monotonic.
+// Inflate one zlib stream starting at buf[0]. One inflateSync call handles
+// the whole stream (it stops at the stream end and ignores trailing bytes),
+// so the only unknown is how many bytes the stream consumed. That length is
+// recovered by re-deflating the inflated data: zlib output is deterministic
+// for a given level, so the re-deflated bytes equal the original stream
+// exactly when the level matches. The common levels are tried first; when
+// none matches (an exotic producer), fall back to the binary search.
 function inflateOne(buf: Buffer): { data: Buffer; consumed: number } {
+  let data: Buffer;
+  try {
+    data = inflateSync(buf);
+  } catch {
+    return inflateOneBinarySearch(buf);
+  }
+  // Git packs use levels 0-9 (default 6); try the most common first.
+  for (const level of [6, 1, 9, 0, 2, 3, 4, 5, 7, 8]) {
+    const re = deflateSync(data, { level });
+    if (re.length <= buf.length && buf.subarray(0, re.length).equals(re)) {
+      return { data, consumed: re.length };
+    }
+  }
+  return inflateOneBinarySearch(buf);
+}
+
+// Binary search for the stream end: a truncated deflate stream throws, a
+// complete one succeeds and ignores trailing bytes, so the predicate is
+// monotonic.
+function inflateOneBinarySearch(buf: Buffer): { data: Buffer; consumed: number } {
   let lo = 1;
   let hi = buf.length;
   let best = -1;
@@ -304,16 +328,16 @@ export function collectPackObjects(
   const walkCommits = (tips: string[], collect: Set<string>, depthLimit: number | null, stopAt?: Set<string>): Set<string> => {
     const seen = new Set<string>();
     const queue: { sha: string; depth: number }[] = tips.map((sha) => ({ sha, depth: 0 }));
-    while (queue.length > 0) {
-      const { sha, depth } = queue.shift()!;
+    for (let qi = 0; qi < queue.length; qi++) {
+      const { sha, depth } = queue[qi];
       if (seen.has(sha)) continue;
-      const obj = getObject(repo, sha);
-      if (!obj || obj.type !== "commit") continue;
+      const info = commitInfo(repo, sha);
+      if (!info) continue;
       seen.add(sha);
       collect.add(sha);
       if (depthLimit !== null && depth >= depthLimit) continue;
       if (stopAt && stopAt.has(sha)) continue;
-      for (const p of parseCommit(obj.data).parents) queue.push({ sha: p, depth: depth + 1 });
+      for (const p of info.parents) queue.push({ sha: p, depth: depth + 1 });
     }
     return seen;
   };
@@ -333,13 +357,13 @@ export function collectPackObjects(
       const obj = getObject(repo, sha);
       if (!obj) continue;
       if (obj.type === "commit") {
-        const c = parseCommit(obj.data);
+        const c = commitInfo(repo, sha)!;
         stack.push(c.tree);
         if (!(clientShallow && clientShallow.has(sha))) {
           for (const p of c.parents) stack.push(p);
         }
       } else if (obj.type === "tree") {
-        for (const e of parseTree(obj.data)) stack.push(e.sha);
+        for (const e of treeEntries(repo, sha)!) stack.push(e.sha);
       } else if (obj.type === "tag") {
         const m = obj.data.toString("utf8").match(/^object ([0-9a-f]{40})$/m);
         if (m) stack.push(m[1]);
@@ -350,11 +374,11 @@ export function collectPackObjects(
   const shallow = new Set<string>();
   const queue: { sha: string; depth: number }[] = wants.map((sha) => ({ sha, depth: 0 }));
   const seenCommits = new Set<string>();
-  while (queue.length > 0) {
-    const { sha, depth } = queue.shift()!;
+  for (let qi = 0; qi < queue.length; qi++) {
+    const { sha, depth } = queue[qi];
     if (seenCommits.has(sha)) continue;
-    const obj = getObject(repo, sha);
-    if (!obj || obj.type !== "commit") continue;
+    const info = commitInfo(repo, sha);
+    if (!info) continue;
     seenCommits.add(sha);
     // Commits at or beyond the depth limit are NOT sent in the packfile.
     // The boundary (reported as "shallow") is the deepest commit that IS
@@ -362,7 +386,7 @@ export function collectPackObjects(
     // commit with no parents.
     if (maxDepth !== null && depth >= maxDepth) continue;
     wantedCommits.add(sha);
-    const parents = parseCommit(obj.data).parents;
+    const parents = info.parents;
     if (maxDepth !== null && (depth + 1 >= maxDepth || parents.length === 0)) shallow.add(sha);
     for (const p of parents) queue.push({ sha: p, depth: depth + 1 });
   }
@@ -375,10 +399,10 @@ export function collectPackObjects(
     added.add(sha);
     objects.push({ type: obj.type, data: obj.data });
     if (obj.type === "commit") {
-      const c = parseCommit(obj.data);
+      const c = commitInfo(repo, sha)!;
       addObject(c.tree);
     } else if (obj.type === "tree") {
-      for (const e of parseTree(obj.data)) addObject(e.sha);
+      for (const e of treeEntries(repo, sha)!) addObject(e.sha);
     } else if (obj.type === "tag") {
       const m = obj.data.toString("utf8").match(/^object ([0-9a-f]{40})$/m);
       if (m) addObject(m[1]);
@@ -386,8 +410,10 @@ export function collectPackObjects(
   };
   for (const sha of wantedCommits) addObject(sha);
   // Annotated tags pointing at wanted commits: include the tag objects.
-  for (const [sha, obj] of repo.objects) {
-    if (obj.type !== "tag") continue;
+  // repo.tagShas tracks exactly the tag objects, so no full-db scan.
+  for (const sha of repo.tagShas) {
+    const obj = getObject(repo, sha);
+    if (!obj || obj.type !== "tag") continue;
     const m = obj.data.toString("utf8").match(/^object ([0-9a-f]{40})$/m);
     if (m && wantedCommits.has(m[1])) addObject(sha);
   }

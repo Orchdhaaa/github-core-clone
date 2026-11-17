@@ -1,7 +1,7 @@
 // Git smart-HTTP handlers: info/refs advertisements, upload-pack (v0 and v2)
 // and receive-pack (v0). Speaks the protocol from the spec; no git binary.
 import type { Repo } from "./store.ts";
-import { getObject, isAncestor, parseCommit } from "./store.ts";
+import { commitInfo, deleteRef, getObject, isAncestor, isFastForward, putObject, setRef } from "./store.ts";
 import {
   buildPack,
   collectPackObjects,
@@ -21,6 +21,18 @@ const UPLOAD_V0_CAPS =
 
 const RECEIVE_V0_CAPS = "report-status side-band-64k delete-refs ofs-delta agent=forge/1.0";
 
+// The v2 capability advertisement never varies, so it is one shared constant.
+const V2_ADVERTISEMENT: Buffer = Buffer.concat([
+  pktLine("version 2\n"),
+  pktLine("ls-refs=unborn\n"),
+  pktLine("fetch=shallow wait-for-done filter\n"),
+  pktLine("server-option\n"),
+  pktLine("object-format=sha1\n"),
+  pktLine("object-info\n"),
+  pktLine("agent=forge/1.0\n"),
+  pktFlush(),
+]);
+
 function sortedRefs(repo: Repo): { name: string; sha: string }[] {
   const out: { name: string; sha: string }[] = [];
   for (const [name, sha] of repo.refs) out.push({ name, sha });
@@ -38,45 +50,47 @@ function refTip(repo: Repo): string {
 // ---------------------------------------------------------------------------
 
 export function uploadPackAdvertisement(repo: Repo, v2: boolean): Buffer {
-  if (v2) {
-    const parts: Buffer[] = [
-      pktLine("version 2\n"),
-      pktLine("ls-refs=unborn\n"),
-      pktLine("fetch=shallow wait-for-done filter\n"),
-      pktLine("server-option\n"),
-      pktLine("object-format=sha1\n"),
-      pktLine("object-info\n"),
-      pktLine("agent=forge/1.0\n"),
-      pktFlush(),
-    ];
-    return Buffer.concat(parts);
-  }
+  if (v2) return V2_ADVERTISEMENT;
+  // A v0 advertisement depends only on the ref set, so it is cached per repo
+  // and invalidated by setRef/deleteRef on any ref change.
+  const cached = repo.uploadV0Adv;
+  if (cached) return cached;
   const parts: Buffer[] = [pktLine("# service=git-upload-pack\n"), pktFlush()];
   if (repo.refs.size === 0) {
     // An empty repository advertises the capabilities on a capabilities^{} line.
     parts.push(pktLine(`${ZERO} capabilities^{}\0${UPLOAD_V0_CAPS}\n`));
     parts.push(pktFlush());
-    return Buffer.concat(parts);
+    const out = Buffer.concat(parts);
+    repo.uploadV0Adv = out;
+    return out;
   }
   const tip = refTip(repo);
   parts.push(pktLine(`${tip} HEAD\0${UPLOAD_V0_CAPS}\n`));
   for (const r of sortedRefs(repo)) parts.push(pktLine(`${r.sha} ${r.name}\n`));
   parts.push(pktFlush());
-  return Buffer.concat(parts);
+  const out = Buffer.concat(parts);
+  repo.uploadV0Adv = out;
+  return out;
 }
 
 export function receivePackAdvertisement(repo: Repo): Buffer {
+  const cached = repo.receiveV0Adv;
+  if (cached) return cached;
   const parts: Buffer[] = [pktLine("# service=git-receive-pack\n"), pktFlush()];
   if (repo.refs.size === 0) {
     parts.push(pktLine(`${ZERO} capabilities^{}\0${RECEIVE_V0_CAPS}\n`));
     parts.push(pktFlush());
-    return Buffer.concat(parts);
+    const out = Buffer.concat(parts);
+    repo.receiveV0Adv = out;
+    return out;
   }
   const tip = refTip(repo);
   parts.push(pktLine(`${tip} HEAD\0${RECEIVE_V0_CAPS}\n`));
   for (const r of sortedRefs(repo)) parts.push(pktLine(`${r.sha} ${r.name}\n`));
   parts.push(pktFlush());
-  return Buffer.concat(parts);
+  const out = Buffer.concat(parts);
+  repo.receiveV0Adv = out;
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -160,14 +174,14 @@ function shallowBoundary(repo: Repo, wants: string[], maxDepth: number | null): 
   const out = new Set<string>();
   const queue: { sha: string; depth: number }[] = wants.map((sha) => ({ sha, depth: 0 }));
   const seen = new Set<string>();
-  while (queue.length > 0) {
-    const { sha, depth } = queue.shift()!;
+  for (let qi = 0; qi < queue.length; qi++) {
+    const { sha, depth } = queue[qi];
     if (seen.has(sha)) continue;
-    const obj = getObject(repo, sha);
-    if (!obj || obj.type !== "commit") continue;
+    const info = commitInfo(repo, sha);
+    if (!info) continue;
     seen.add(sha);
     if (depth >= maxDepth) continue;
-    const parents = parseCommit(obj.data).parents;
+    const parents = info.parents;
     if (depth + 1 >= maxDepth || parents.length === 0) out.add(sha);
     for (const p of parents) queue.push({ sha: p, depth: depth + 1 });
   }
@@ -234,6 +248,11 @@ export function handleUploadPackV2(repo: Repo, body: Buffer): Buffer {
       else if (a.startsWith("ref-prefix ")) prefixes.push(a.slice(11));
       else if (a.startsWith("ref-limit ")) limit = parseInt(a.slice(10), 10) || -1;
     }
+    // ls-refs output depends only on the ref set and these args, so it is
+    // cached per repo and invalidated by setRef/deleteRef on any ref change.
+    const lsKey = JSON.stringify({ peel, symrefs, unborn, prefixes, limit });
+    const lsCached = repo.lsRefsCache.get(lsKey);
+    if (lsCached) return lsCached;
     const parts: Buffer[] = [];
     const tip = refTip(repo);
     const headIncluded = prefixes.length === 0 || prefixes.some((p) => "HEAD".startsWith(p));
@@ -267,7 +286,9 @@ export function handleUploadPackV2(repo: Repo, body: Buffer): Buffer {
     }
     // Annotated tags that peel: the peeled target is an attribute, already added.
     parts.push(pktFlush());
-    return Buffer.concat(parts);
+    const lsOut = Buffer.concat(parts);
+    repo.lsRefsCache.set(lsKey, lsOut);
+    return lsOut;
   }
   if (command === "fetch") {
     const wants: string[] = [];
@@ -399,11 +420,7 @@ export function handleReceivePack(repo: Repo, body: Buffer): { status: number; b
   if (rest.length > 0) {
     try {
       const objects = parsePack(rest);
-      for (const obj of objects) {
-        if (!getObject(repo, obj.sha)) {
-          repo.objects.set(obj.sha, { type: obj.type, data: obj.data });
-        }
-      }
+      for (const obj of objects) putObject(repo, obj.type, obj.data, obj.sha);
     } catch (e) {
       unpackOk = false;
       unpackError = e instanceof Error ? e.message : "unpack failed";
@@ -421,7 +438,7 @@ export function handleReceivePack(repo: Repo, body: Buffer): { status: number; b
         } else if (!getObject(repo, u.newSha) && u.newSha !== ZERO) {
           report.push(`ng ${u.ref} new object missing\n`);
         } else {
-          repo.refs.set(u.ref, u.newSha);
+          setRef(repo, u.ref, u.newSha);
           report.push(`ok ${u.ref}\n`);
         }
       } else if (u.newSha === ZERO) {
@@ -430,7 +447,7 @@ export function handleReceivePack(repo: Repo, body: Buffer): { status: number; b
         } else if (current !== u.oldSha) {
           report.push(`ng ${u.ref} stale\n`);
         } else {
-          repo.refs.delete(u.ref);
+          deleteRef(repo, u.ref);
           report.push(`ok ${u.ref}\n`);
         }
       } else {
@@ -438,10 +455,10 @@ export function handleReceivePack(repo: Repo, body: Buffer): { status: number; b
           report.push(`ng ${u.ref} ref does not exist\n`);
         } else if (current !== u.oldSha) {
           report.push(`ng ${u.ref} stale\n`);
-        } else if (!isAncestor(repo, u.oldSha, u.newSha)) {
+        } else if (!isFastForward(repo, u.ref, u.oldSha, u.newSha)) {
           report.push(`ng ${u.ref} non-fast-forward\n`);
         } else {
-          repo.refs.set(u.ref, u.newSha);
+          setRef(repo, u.ref, u.newSha);
           report.push(`ok ${u.ref}\n`);
         }
       }

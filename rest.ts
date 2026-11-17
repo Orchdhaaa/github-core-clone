@@ -2,16 +2,18 @@
 import type { Issue, IssueComment, Label, PullRequest, Repo, Store } from "./store.ts";
 import {
   branchTip,
+  commitInfo,
   createCommit,
   createRepo,
+  deleteRef,
   flatTree,
   getFileAt,
   getObject,
   isAncestor,
-  parseCommit,
   prChangedFiles,
   prMergeable,
   refName,
+  setRef,
   squashMerge,
   storeObject,
   treeWithFile,
@@ -303,8 +305,7 @@ function requireRepo(store: Store, owner: string, name: string): Repo {
 }
 
 function commitObject(store: Store, repo: Repo, sha: string, message: string): Record<string, unknown> {
-  const obj = getObject(repo, sha);
-  const info = obj ? parseCommit(obj.data) : null;
+  const info = commitInfo(repo, sha);
   return {
     sha,
     message,
@@ -493,11 +494,10 @@ export function dispatchRest(
           const treeSha = treeWithFile(repo, tip, filePath, blobSha);
           const parents = tip ? [tip] : [];
           const commitSha = createCommit(store, repo, treeSha, parents, message);
-          repo.refs.set(refName(branch), commitSha);
+          setRef(repo, refName(branch), commitSha);
           const now = store.clock.nextIso();
           repo.updatedAt = now;
           repo.pushedAt = now;
-          repo.packCache.clear();
           const contentObj = {
             type: "file",
             encoding: "base64",
@@ -531,11 +531,10 @@ export function dispatchRest(
           const treeSha = treeWithoutFile(repo, tip, filePath);
           if (treeSha === null) throw new HttpError(404, "Not Found");
           const commitSha = createCommit(store, repo, treeSha, [tip], message);
-          repo.refs.set(refName(branch), commitSha);
+          setRef(repo, refName(branch), commitSha);
           const now = store.clock.nextIso();
           repo.updatedAt = now;
           repo.pushedAt = now;
-          repo.packCache.clear();
           return json(200, { commit: commitObject(store, repo, commitSha, message) });
         }
         throw new HttpError(404, "Not Found");
@@ -827,9 +826,8 @@ export function dispatchRest(
               const sha = stack.pop()!;
               if (seen.has(sha)) continue;
               seen.add(sha);
-              const obj = getObject(repo, sha);
-              if (!obj || obj.type !== "commit") continue;
-              const info = parseCommit(obj.data);
+              const info = commitInfo(repo, sha);
+              if (!info) continue;
               out.push({
                 sha,
                 commit: {
@@ -861,8 +859,7 @@ export function dispatchRest(
           }
           if (!getObject(repo, sha)) return errJson(422, "Validation Failed");
           if (repo.refs.has(ref)) return errJson(422, "Validation Failed");
-          repo.refs.set(ref, sha);
-          repo.packCache.clear();
+          setRef(repo, ref, sha);
           const obj = getObject(repo, sha);
           return json(201, {
             ref,
@@ -898,8 +895,7 @@ export function dispatchRest(
           if (!force && !isAncestor(repo, sha, newSha)) {
             return errJson(422, "Validation Failed");
           }
-          repo.refs.set(full, newSha);
-          repo.packCache.clear();
+          setRef(repo, full, newSha);
           const obj = getObject(repo, newSha);
           return json(200, {
             ref: full,
@@ -912,8 +908,7 @@ export function dispatchRest(
           const refPath = rest.slice(2).join("/");
           const full = `refs/${refPath}`;
           if (!repo.refs.has(full)) throw new HttpError(404, "Not Found");
-          repo.refs.delete(full);
-          repo.packCache.clear();
+          deleteRef(repo, full);
           return { status: 204, body: "" };
         }
         throw new HttpError(404, "Not Found");

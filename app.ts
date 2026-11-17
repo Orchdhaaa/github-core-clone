@@ -205,5 +205,10 @@ export function createForgeServer(opts: ServerOptions): Server {
       }
     })();
   });
+  // Disable Nagle's algorithm: small git/REST responses go out immediately
+  // instead of waiting to coalesce with the next write.
+  server.on("connection", (socket) => {
+    socket.setNoDelay(true);
+  });
   return server;
 }
