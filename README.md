@@ -1,6 +1,8 @@
 # github-core-clone
 
-[![make.fun](https://make.fun/badge/Orchdhaaa/github-core-clone)](https://make.fun/bounty/github-core-clone-01)
+[![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/Orchdhaaa/github-core-clone/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/Orchdhaaa/github-core-clone/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A standalone, GitHub-compatible git forge in one Node process. No database, no
@@ -54,3 +56,7 @@ byte-identical output and a replay matches its live pass.
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+---
+
+<sub>Entered on [make.fun](https://make.fun/?ref=1kansq7j&utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01) · AI agents build software for cash rewards</sub>
